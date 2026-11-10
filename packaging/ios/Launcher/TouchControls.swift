@@ -4,7 +4,7 @@ import UIKit
 /// Original Horizon control editor. No Amethyst/Pojav implementation is used.
 /// IDs/order are the version-one ABI in touch.rs and horizon-ios-launcher.
 enum TouchButton: Int, CaseIterable, Codable, Identifiable {
-    case forward, back, left, right, sneak, jump, perspective, chat, pause, inventory
+    case forward, back, left, right, sneak, jump, perspective, chat, pause, inventory, attack, use, offhand
     var id: Int { rawValue }
     var title: String {
         switch self {
@@ -18,6 +18,9 @@ enum TouchButton: Int, CaseIterable, Codable, Identifiable {
         case .chat: return "Chat"
         case .pause: return "Pause"
         case .inventory: return "Inventory"
+        case .attack: return "Hit / Break"
+        case .use: return "Use / Place"
+        case .offhand: return "Offhand"
         }
     }
     var symbol: String {
@@ -32,6 +35,9 @@ enum TouchButton: Int, CaseIterable, Codable, Identifiable {
         case .chat: return "text.bubble"
         case .pause: return "pause"
         case .inventory: return "ellipsis"
+        case .attack: return "hammer"
+        case .use: return "cube"
+        case .offhand: return "arrow.left.arrow.right"
         }
     }
     // GUI pixels, matching touch::default_layout. Hotbar is the game's HUD,
@@ -48,6 +54,9 @@ enum TouchButton: Int, CaseIterable, Codable, Identifiable {
         case .sneak: return CGRect(x: cx, y: cy, width: s, height: s)
         case .jump: return CGRect(x: w - 14 - s, y: cy, width: s, height: s)
         case .inventory: return CGRect(x: floor(w / 2 - 91) + 184, y: h - 30, width: 30, height: 30)
+        case .attack: return CGRect(x: w - 14 - s, y: cy - s - 4, width: s, height: s)
+        case .use: return CGRect(x: w - 14 - 2 * s - 4, y: cy - s - 4, width: s, height: s)
+        case .offhand: return CGRect(x: floor(w / 2 - 91) - 32, y: h - 30, width: 30, height: 30)
         default:
             let i = rawValue - TouchButton.perspective.rawValue
             return CGRect(x: (w - 3 * small - 8) / 2 + CGFloat(i) * (small + 4), y: 2, width: small, height: small)
@@ -62,11 +71,48 @@ struct TouchCentre: Codable, Equatable {
 }
 
 struct TouchConfiguration: Codable, Equatable {
+    /// The size multipliers the editor offers; mirrored by MIN_SCALE/MAX_SCALE in touch.rs.
+    static let minScale = 0.5
+    static let maxScale = 2.0
+
     var centres: [String: TouchCentre] = [:]
+    /// Size multipliers by button; a missing entry is the built-in size.
+    var sizes: [String: Double] = [:]
     var showControls = true
 
-    func rect(_ button: TouchButton, in size: CGSize) -> CGRect {
+    init() {}
+    private enum CodingKeys: String, CodingKey { case centres, sizes, showControls }
+    /// Layouts saved before sizes existed have no `sizes` key and must keep their positions.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        centres = try c.decodeIfPresent([String: TouchCentre].self, forKey: .centres) ?? [:]
+        sizes = try c.decodeIfPresent([String: Double].self, forKey: .sizes) ?? [:]
+        showControls = try c.decodeIfPresent(Bool.self, forKey: .showControls) ?? true
+    }
+
+    func scale(_ button: TouchButton) -> CGFloat {
+        guard let v = sizes[String(button.rawValue)], v.isFinite, v > 0 else { return 1 }
+        return CGFloat(min(Self.maxScale, max(Self.minScale, v)))
+    }
+    mutating func setScale(_ button: TouchButton, _ value: Double) {
+        let v = min(Self.maxScale, max(Self.minScale, value))
+        if abs(v - 1) < 0.005 { sizes[String(button.rawValue)] = nil } else { sizes[String(button.rawValue)] = v }
+    }
+    /// The built-in rectangle grown or shrunk around its own centre, as touch.rs does before placing it.
+    private func sized(_ button: TouchButton, in size: CGSize) -> CGRect {
         var r = button.rect(in: size)
+        let k = scale(button)
+        guard k != 1 else { return r }
+        let centre = CGPoint(x: r.midX, y: r.midY)
+        r.size = CGSize(width: r.width * k, height: r.height * k)
+        r.origin = CGPoint(x: centre.x - r.width / 2, y: centre.y - r.height / 2)
+        r.origin.x = max(0, min(size.width - r.width, r.origin.x))
+        r.origin.y = max(0, min(size.height - r.height, r.origin.y))
+        return r
+    }
+
+    func rect(_ button: TouchButton, in size: CGSize) -> CGRect {
+        var r = sized(button, in: size)
         if let c = centres[String(button.rawValue)], c.valid {
             r.origin.x = max(0, min(size.width - r.width, c.x * size.width - r.width / 2))
             r.origin.y = max(0, min(size.height - r.height, c.y * size.height - r.height / 2))
@@ -75,7 +121,7 @@ struct TouchConfiguration: Codable, Equatable {
     }
     mutating func move(_ button: TouchButton, to point: CGPoint, in size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
-        let r = button.rect(in: size)
+        let r = sized(button, in: size)
         let x = max(r.width / 2, min(size.width - r.width / 2, point.x))
         let y = max(r.height / 2, min(size.height - r.height / 2, point.y))
         centres[String(button.rawValue)] = TouchCentre(x: x / size.width, y: y / size.height)
@@ -86,6 +132,18 @@ struct TouchConfiguration: Codable, Equatable {
             return [Float(c.x), Float(c.y)]
         }
         return (points, showControls ? 0 : 1)
+    }
+    /// One multiplier per button in `TouchButton` order; NaN is the built-in size.
+    func sizeSnapshot() -> [Float] {
+        TouchButton.allCases.map { b in
+            guard let v = sizes[String(b.rawValue)], v.isFinite, v > 0 else { return .nan }
+            return Float(min(Self.maxScale, max(Self.minScale, v)))
+        }
+    }
+    /// ABI v2: the centres (26), then the sizes (13).
+    func snapshotV2() -> ([Float], UInt32) {
+        let (points, flags) = snapshot()
+        return (points + sizeSnapshot(), flags)
     }
 }
 
@@ -114,6 +172,10 @@ final class TouchPreferences: ObservableObject {
         lock.lock(); defer { lock.unlock() }
         return cached.snapshot()
     }
+    func snapshotV2() -> ([Float], UInt32) {
+        lock.lock(); defer { lock.unlock() }
+        return cached.snapshotV2()
+    }
 }
 
 @_cdecl("horizon_touch_preferences_v1")
@@ -121,6 +183,15 @@ public func horizonTouchPreferences(_ buffer: UnsafeMutablePointer<Float>?, _ ca
     guard let buffer, capacity >= 20 else { return 0 }
     let (values, flags) = TouchPreferences.shared.snapshot()
     for i in 0..<20 { buffer[i] = values[i] }
+    return flags
+}
+
+/// ABI v2: 26 centres then 13 sizes, 39 floats, NaN for the built-in placement or size.
+@_cdecl("horizon_touch_preferences_v2")
+public func horizonTouchPreferencesV2(_ buffer: UnsafeMutablePointer<Float>?, _ capacity: UInt32) -> UInt32 {
+    guard let buffer, capacity >= 39 else { return 0 }
+    let (values, flags) = TouchPreferences.shared.snapshotV2()
+    for i in 0..<39 { buffer[i] = values[i] }
     return flags
 }
 
@@ -175,9 +246,13 @@ private final class TouchEditorController: UIHostingController<AnyView> {
 }
 
 private struct TouchLayoutEditor: View {
+    /// A button's size being changed in the mini panel, and the size to go back to on Cancel.
+    private struct SizeEdit { let button: TouchButton; let original: Double? }
+
     @State private var draft: TouchConfiguration
     @State private var dragStart: CGPoint?
     @State private var selected: TouchButton?
+    @State private var sizing: SizeEdit?
     @State private var confirmReset = false
     let finish: (TouchConfiguration?) -> Void
     init(initial: TouchConfiguration, finish: @escaping (TouchConfiguration?) -> Void) {
@@ -186,6 +261,15 @@ private struct TouchLayoutEditor: View {
     @State private var toolbarCentre: CGPoint?
     @State private var toolbarStart: CGPoint?
     @State private var guiLimit = TouchEditorGeometry.savedScale()
+
+    private func sizeBinding(_ button: TouchButton) -> Binding<Double> {
+        Binding(get: { Double(draft.scale(button)) }, set: { draft.setScale(button, $0) })
+    }
+    private func cancelSize(_ edit: SizeEdit) {
+        draft.sizes[String(edit.button.rawValue)] = edit.original
+        sizing = nil
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let width = geometry.size.width
@@ -196,31 +280,35 @@ private struct TouchLayoutEditor: View {
             let toolbarWidth = min(500.0, max(280.0, width - 32))
             ZStack(alignment: .topLeading) {
                 Color.black
+                    .contentShape(Rectangle())
+                    .onTapGesture { if sizing == nil { selected = nil } }
                 Rectangle().stroke(Color.white.opacity(0.2), lineWidth: 1)
                     .frame(width: 182 * scale, height: 22 * scale)
                     .position(x: (gui.width / 2) * scale, y: (gui.height - 11) * scale)
                     .allowsHitTesting(false)
-                    ForEach(TouchButton.allCases) { button in
-                        let r = draft.rect(button, in: gui)
-                        Image(systemName: button.symbol)
-                            .font(.system(size: max(12, r.height * scale * 0.34), weight: .semibold))
-                            .frame(width: r.width * scale, height: r.height * scale)
-                            .background(selected == button ? Color.accentColor.opacity(0.45) : Color.white.opacity(0.18))
-                            .overlay(Rectangle().stroke(.white.opacity(0.6)))
-                            .clipShape(Rectangle())
-                            .contentShape(Rectangle())
-                            .position(x: r.midX * scale, y: r.midY * scale)
-                            .zIndex(selected == button ? 1 : 0)
-                            .accessibilityLabel(button.title)
-                            .accessibilityIdentifier("touch-layout-\(button.rawValue)")
-                            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                                if selected != button || dragStart == nil {
-                                    selected = button; dragStart = CGPoint(x: r.midX, y: r.midY)
-                                }
-                                guard let start = dragStart else { return }
-                                draft.move(button, to: CGPoint(x: start.x + value.translation.width / scale, y: start.y + value.translation.height / scale), in: gui)
-                            }.onEnded { _ in dragStart = nil })
-                    }
+                ForEach(TouchButton.allCases) { button in
+                    let r = draft.rect(button, in: gui)
+                    let isSelected = selected == button
+                    Image(systemName: button.symbol)
+                        .font(.system(size: max(12, r.height * scale * 0.34), weight: .semibold))
+                        .frame(width: r.width * scale, height: r.height * scale)
+                        .background(isSelected ? Color.accentColor.opacity(0.45) : Color.white.opacity(0.18))
+                        .overlay(Rectangle().stroke(isSelected ? Color.yellow : Color.white.opacity(0.6), lineWidth: isSelected ? 2 : 1))
+                        .clipShape(Rectangle())
+                        .contentShape(Rectangle())
+                        .position(x: r.midX * scale, y: r.midY * scale)
+                        .zIndex(isSelected ? 1 : 0)
+                        .accessibilityLabel(button.title)
+                        .accessibilityIdentifier("touch-layout-\(button.rawValue)")
+                        .allowsHitTesting(sizing == nil)
+                        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                            if selected != button || dragStart == nil {
+                                selected = button; dragStart = CGPoint(x: r.midX, y: r.midY)
+                            }
+                            guard let start = dragStart else { return }
+                            draft.move(button, to: CGPoint(x: start.x + value.translation.width / scale, y: start.y + value.translation.height / scale), in: gui)
+                        }.onEnded { _ in dragStart = nil })
+                }
 
                 VStack(spacing: 0) {
                     Image(systemName: "line.3.horizontal")
@@ -233,25 +321,52 @@ private struct TouchLayoutEditor: View {
                             toolbarStart = origin
                             toolbarCentre = CGPoint(
                                 x: min(width - toolbarWidth / 2, max(toolbarWidth / 2, origin.x + value.translation.width)),
-                                y: min(height - 45, max(45, origin.y + value.translation.height)))
+                                y: min(height - 70, max(70, origin.y + value.translation.height)))
                         }.onEnded { _ in toolbarStart = nil })
-            HStack(spacing: 20) {
-                Button { finish(nil) } label: { Text("Cancel").frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-cancel")
-                Spacer(minLength: 4)
-                Menu {
-                    ForEach(TouchButton.allCases) { button in
-                        Button(button.title) { selected = button; dragStart = nil }
+                    HStack(spacing: 20) {
+                        Button { finish(nil) } label: { Text("Cancel").frame(minWidth: 50, minHeight: 44) }
+                            .accessibilityIdentifier("touch-editor-cancel")
+                        Spacer(minLength: 4)
+                        Menu {
+                            ForEach(TouchButton.allCases) { button in
+                                Button(button.title) { selected = button; dragStart = nil }
+                            }
+                        } label: { Label(selected?.title ?? "Touch Layout", systemImage: "hand.draw") }
+                            .accessibilityIdentifier("touch-editor-select")
+                        Spacer(minLength: 4)
+                        Button { confirmReset = true } label: { Text("Reset").frame(minWidth: 50, minHeight: 44) }
+                            .accessibilityIdentifier("touch-editor-reset")
+                        Button { finish(draft) } label: { Text("Save").fontWeight(.semibold).frame(minWidth: 50, minHeight: 44) }
+                            .accessibilityIdentifier("touch-editor-save")
                     }
-                } label: { Label(selected?.title ?? "Touch Layout", systemImage: "hand.draw") }
-                    .accessibilityIdentifier("touch-editor-select")
-                Spacer(minLength: 4)
-                Button { confirmReset = true } label: { Text("Reset").frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-reset")
-                Button { finish(draft) } label: { Text("Save").fontWeight(.semibold).frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-save")
-            }.padding(.horizontal, 12).frame(height: 54)
+                    .padding(.horizontal, 12).frame(height: 54)
+                    .disabled(sizing != nil)
 
+                    if let edit = sizing {
+                        // The mini panel: drag the slider left or right, then Done keeps the size and Cancel
+                        // puts back the one it had.
+                        Divider().overlay(Color.white.opacity(0.2))
+                        HStack(spacing: 12) {
+                            Button { cancelSize(edit) } label: { Text("Cancel").frame(minWidth: 50, minHeight: 44) }
+                                .accessibilityIdentifier("touch-size-cancel")
+                            Slider(value: sizeBinding(edit.button), in: TouchConfiguration.minScale...TouchConfiguration.maxScale)
+                                .accessibilityIdentifier("touch-size-slider")
+                            Text("\(Int((draft.scale(edit.button) * 100).rounded()))%")
+                                .monospacedDigit().frame(width: 50, alignment: .trailing)
+                            Button { sizing = nil } label: { Text("Done").fontWeight(.semibold).frame(minWidth: 50, minHeight: 44) }
+                                .accessibilityIdentifier("touch-size-done")
+                        }.padding(.horizontal, 12).frame(height: 54)
+                    } else if let button = selected {
+                        Divider().overlay(Color.white.opacity(0.2))
+                        HStack {
+                            Text(button.title).font(.footnote).foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                sizing = SizeEdit(button: button, original: draft.sizes[String(button.rawValue)])
+                            } label: { Text("Size").fontWeight(.semibold).frame(minWidth: 60, minHeight: 44) }
+                                .accessibilityIdentifier("touch-editor-size")
+                        }.padding(.horizontal, 16).frame(height: 50)
+                    }
                 }
                 .frame(width: toolbarWidth)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
@@ -264,9 +379,9 @@ private struct TouchLayoutEditor: View {
         .ignoresSafeArea()
         .background(Color.black)
         .foregroundStyle(.white).preferredColorScheme(.dark)
-        .confirmationDialog("Reset all button positions?", isPresented: $confirmReset, titleVisibility: .visible) {
-            Button("Reset Layout", role: .destructive) { draft.centres = [:]; selected = nil; dragStart = nil }
-        } message: { Text("Save to keep the default positions, or Cancel to keep your current layout.") }
+        .confirmationDialog("Reset all button positions and sizes?", isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Reset Layout", role: .destructive) { draft.centres = [:]; draft.sizes = [:]; selected = nil; dragStart = nil }
+        } message: { Text("Save to keep the default layout, or Cancel to keep your current layout.") }
     }
 }
 

@@ -1,487 +1,1036 @@
-//! Touch controls for phones and tablets (Horizon's own), after Minecraft: Pocket Edition's: a D-pad on the
-//! left with sneak in its centre, jump on the right, perspective, chat and pause at the top, and the hotbar
-//! and an inventory button along the bottom. A finger anywhere else turns the view; a short tap uses (or
-//! attacks the entity under the crosshair), and holding still mines.
-//!
-//! This module is the layout and the fingers' state: positions in GUI pixels in, [`Out`]s for the game to act
-//! on out. game/touch.rs feeds it winit's touches and acts on what comes back.
+//! Touch screens (phones and tablets; Horizon's own): Pocket Edition's controls while playing, and a finger
+//! as the mouse over every screen. The layout and the fingers' state are the lib's `touch`; this file acts on
+//! what they say the way the keyboard and mouse would: the D-pad and buttons are their default keys, a tap is
+//! a click, holding still is a held left button, and a drag turns the view as the mouse does.
+use super::event_loop::EventLoopCtl;
+use super::{Game, Screen};
+use horizon_client::{
+    Result,
+    held::Source,
+    hud::{HudBatch, rgba},
+    touch::{self, Control, MenuAction, MenuGesture, MenuMode, Out, Touches},
+};
+use std::time::Instant;
+use winit::{
+    dpi::PhysicalPosition,
+    event::{
+        DeviceId, ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+    },
+    keyboard::KeyCode,
+    window::WindowId,
+};
 
-#[path = "touch/menu.rs"]
-mod menu;
-pub use menu::{MenuAction, MenuGesture, MenuMode};
-
-/// A button of the layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Control {
-    Forward,
-    Back,
-    Left,
-    Right,
-    /// The D-pad's centre: sneaking, toggled.
-    Sneak,
-    Jump,
-    Perspective,
-    Chat,
-    Pause,
-    Inventory,
-    Hotbar(u8),
+#[derive(Default)]
+pub(super) struct TouchInput {
+    fingers: Touches,
+    /// A pointer event derived from a finger; the trace records the original
+    /// touch once, not this translation a second time.
+    synthetic: bool,
+    /// A touch has been seen: the controls are drawn (from the start on iPhone and iPad).
+    seen: bool,
+    /// The last input device controls only the visibility of touch overlays.
+    hardware: super::input_mode::InputMode,
+    /// The finger that is the pointer over a menu.
+    menu: Option<MenuFinger>,
+    /// Clicks to release once a tick has passed: vanilla samples buttons once a tick, so a tap released in
+    /// the same frame would be lost (the pad holds its short presses back the same way).
+    late: Vec<(MouseButton, u64)>,
+    /// The button a finger held still on the world is holding down: attack to mine, or use to eat, drink or
+    /// draw a bow.
+    holding: Option<MouseButton>,
+    /// The Hit button's tap on a block: breaking carries on by itself until the block is gone, so the
+    /// finger need not stay down. A second tap on the button stops it.
+    auto_break: Option<AutoBreak>,
+    clock: Option<Instant>,
 }
 
-impl Control {
-    /// The D-pad's directions, which a finger can slide between.
-    fn moves(self) -> bool {
-        matches!(
-            self,
-            Control::Forward | Control::Back | Control::Left | Control::Right
+/// A block being broken for a tap of the Hit button.
+struct AutoBreak {
+    /// The tick the tap landed on.
+    since: u64,
+    /// Breaking has been seen under way: it is over once it is not.
+    mining: bool,
+}
+
+/// Ticks a tap on nothing breakable (the air, or a creative break that is over at once) holds the attack for.
+const AUTO_BREAK_GRACE: u64 = 3;
+
+/// A finger over a menu. Its press waits for a frame drawn with the pointer under it, and its release for a
+/// frame after the press: screens find what is under the pointer while drawing, so a pointer that moved and
+/// pressed in one go would press whatever was under the old position (or nothing).
+struct MenuFinger {
+    id: u64,
+    gesture: MenuGesture,
+    target: MenuTarget,
+    at: (f32, f32),
+    guard: Option<horizon_client::widgets::PointerGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuTarget {
+    Pointer,
+    Close,
+    Keyboard,
+}
+
+/// The key a button stands for: the vanilla default of its mapping.
+fn key_of(control: Control) -> Option<KeyCode> {
+    Some(match control {
+        Control::Forward => KeyCode::KeyW,
+        Control::Back => KeyCode::KeyS,
+        Control::Left => KeyCode::KeyA,
+        Control::Right => KeyCode::KeyD,
+        Control::Jump => KeyCode::Space,
+        Control::Perspective => KeyCode::F5,
+        Control::Chat => KeyCode::KeyT,
+        Control::Pause => KeyCode::Escape,
+        Control::Inventory => KeyCode::KeyE,
+        // key.swapOffhand.
+        Control::Offhand => KeyCode::KeyF,
+        // Hit and use are mouse buttons, handled in `touch_act`.
+        Control::Sneak | Control::Attack | Control::Use | Control::Hotbar(_) => return None,
+    })
+}
+
+impl Game<'_> {
+    /// Where touches land, in GUI pixels: the screen the game draws on, or the phone's window when the
+    /// phone is splitscreen's controller ([`Self::touch_on_phone`]).
+    fn touch_batch(&self) -> Option<HudBatch> {
+        if self.touch_on_phone() {
+            return self.window.as_ref().map(|w| {
+                let size = w.inner_size();
+                HudBatch::new([size.width, size.height])
+            });
+        }
+        self.screen_batch()
+    }
+
+    /// The screen the game draws on, in GUI pixels.
+    fn screen_batch(&self) -> Option<HudBatch> {
+        self.renderer
+            .as_ref()
+            .map(|r| HudBatch::new([r.config.width, r.config.height]))
+    }
+
+    /// Splitscreen's second player on the AirPlay display (game/splitscreen.rs): the phone is their
+    /// controller, with the buttons drawn on it and not on the display, laid out in its own pixels.
+    pub(super) fn touch_on_phone(&self) -> bool {
+        self.splitscreen.guest && self.on_airplay()
+    }
+
+    /// A point of the touch screen on the screen the game draws on: the same point, or, when the phone is the
+    /// controller, the point as far across and down the display's half as it was across and down the phone.
+    fn screen_point(&self, at: (f32, f32)) -> (f32, f32) {
+        if !self.touch_on_phone() {
+            return at;
+        }
+        match (self.touch_batch(), self.screen_batch()) {
+            (Some(phone), Some(screen)) => (
+                at.0 / phone.width.max(1.0) * screen.width,
+                at.1 / phone.height.max(1.0) * screen.height,
+            ),
+            _ => at,
+        }
+    }
+
+    fn touch_now(&mut self) -> f64 {
+        self.touch
+            .clock
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f64()
+    }
+
+    /// The world is under the fingers, with no screen over it.
+    pub(super) fn touch_playing(&self) -> bool {
+        !self.menu_input_blocked()
+            && self.title.is_none()
+            && self.screen == Screen::Playing
+            && self.sign_edit.is_none()
+            && self.book.is_none()
+            && self.server_packs.prompt.is_none()
+            && !self.dialog_open()
+            && self.player.is_some()
+    }
+
+    /// The controls are on screen: after a touch, from the start on iPhone and iPad, or with `HORIZON_TOUCH=1`
+    /// (laying them out on a computer).
+    /// Hide only touch overlays, and only while the last-used hardware is still connected.
+    fn hardware_hides_touch(&self) -> bool {
+        self.touch.hardware.hides_touch(
+            horizon_gamecontroller::keyboard_connected(),
+            horizon_gamecontroller::mouse_connected(),
         )
     }
-}
 
-/// `[x, y, width, height]` in GUI pixels.
-pub type Rect = [f32; 4];
-
-/// The D-pad's and jump's button size on a `h` GUI-pixel-high screen: about a seventh of the height, so a
-/// phone (GUI scale 4, 292 high) gets 40 GUI pixels, some 53 points, over Apple's 44-point minimum.
-pub fn button_size(h: f32) -> f32 {
-    (h * 0.14).clamp(26.0, 48.0)
-}
-/// The gap kept from the screen's edges.
-const MARGIN: f32 = 14.0;
-/// How far above the hotbar its slots still take a tap: a thumb lands high.
-const HOTBAR_REACH: f32 = 8.0;
-
-/// Where every button is on a `w` x `h` GUI-pixel screen.
-fn default_layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
-    let s = button_size(h);
-    let small = (s * 0.65).round();
-    // The D-pad's centre cell, high enough that its bottom row clears the screen's edge.
-    let (cx, cy) = (MARGIN + s, h - MARGIN - 2.0 * s - 8.0);
-    let mut v = vec![
-        (Control::Forward, [cx, cy - s, s, s]),
-        (Control::Left, [cx - s, cy, s, s]),
-        (Control::Sneak, [cx, cy, s, s]),
-        (Control::Right, [cx + s, cy, s, s]),
-        (Control::Back, [cx, cy + s, s, s]),
-        (Control::Jump, [w - MARGIN - s, cy, s, s]),
-    ];
-    let top = [Control::Perspective, Control::Chat, Control::Pause];
-    let x0 = (w - 3.0 * small - 8.0) / 2.0;
-    for (i, control) in top.into_iter().enumerate() {
-        v.push((control, [x0 + i as f32 * (small + 4.0), 2.0, small, small]));
-    }
-    // Gui.extractItemHotbar's slots: the bar is 182 wide, centred, 22 high at the bottom.
-    let (hx, hy) = ((w / 2.0 - 91.0).floor(), h - 22.0);
-    for slot in 0..9u8 {
-        v.push((
-            Control::Hotbar(slot),
-            [
-                hx + 1.0 + 20.0 * f32::from(slot),
-                hy - HOTBAR_REACH,
-                20.0,
-                22.0 + HOTBAR_REACH,
-            ],
-        ));
-    }
-    v.push((
-        Control::Inventory,
-        [hx + 184.0, hy - HOTBAR_REACH, 30.0, 22.0 + HOTBAR_REACH],
-    ));
-    v
-}
-
-/// Stable order shared with the app's layout editor; hotbar slots remain on the HUD.
-const EDITABLE: [Control; 10] = [
-    Control::Forward,
-    Control::Back,
-    Control::Left,
-    Control::Right,
-    Control::Sneak,
-    Control::Jump,
-    Control::Perspective,
-    Control::Chat,
-    Control::Pause,
-    Control::Inventory,
-];
-
-/// Apply normalized centres to the same rectangles used by paint and hit tests.
-/// Missing/non-finite coordinates use the original position; valid centres are
-/// clamped by the actual button size, including after resizing or a GUI scale change.
-pub fn layout_with_positions(w: f32, h: f32, positions: &[f32; 20]) -> Vec<(Control, Rect)> {
-    let mut buttons = default_layout(w, h);
-    for (control, rect) in &mut buttons {
-        let Some(i) = EDITABLE.iter().position(|c| c == control) else {
-            continue;
-        };
-        let (x, y) = (positions[i * 2], positions[i * 2 + 1]);
-        if x.is_finite() && y.is_finite() {
-            rect[0] = (x * w - rect[2] / 2.0).clamp(0.0, (w - rect[2]).max(0.0));
-            rect[1] = (y * h - rect[3] / 2.0).clamp(0.0, (h - rect[3]).max(0.0));
+    pub(super) fn touch_keyboard_used(&mut self, event_loop: &dyn EventLoopCtl) {
+        self.touch_release_menu(event_loop);
+        if horizon_gamecontroller::keyboard_connected() {
+            self.touch.hardware.keyboard();
         }
     }
-    buttons
-}
 
-pub fn layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
-    #[cfg(target_os = "ios")]
-    return layout_with_positions(w, h, &horizon_ios_launcher::touch_preferences().0);
-    #[cfg(not(target_os = "ios"))]
-    default_layout(w, h)
-}
+    pub(super) fn touch_mouse_used(&mut self, event_loop: &dyn EventLoopCtl) {
+        self.touch_release_menu(event_loop);
+        self.touch.hardware.mouse();
+    }
 
-/// Paint can disappear for a clean capture without disabling the touch regions.
-pub fn controls_visible() -> bool {
-    #[cfg(target_os = "ios")]
-    return !horizon_ios_launcher::touch_preferences().1;
-    #[cfg(not(target_os = "ios"))]
-    true
-}
+    fn touch_shown(&self) -> bool {
+        // On AirPlay the phone is covered and the game is played with a controller (game/airplay.rs), but for
+        // splitscreen's second player, whose controller the phone is.
+        (!self.on_airplay() || self.splitscreen.guest)
+            && (self.touch.seen
+                || cfg!(any(target_os = "ios", target_os = "android"))
+                || std::env::var_os("HORIZON_TOUCH").is_some_and(|v| v == "1"))
+    }
 
-/// The close button over a screen that has none of its own (an inventory, chat, a sign): the top right.
-pub fn close_rect(w: f32, h: f32) -> Rect {
-    let s = (button_size(h) * 0.75).round();
-    [w - s - 4.0, 4.0, s, s]
-}
-
-/// The keyboard button, left of the close button: over a focused text field, it asks for the system's
-/// keyboard again.
-pub fn keyboard_rect(w: f32, h: f32) -> Rect {
-    let c = close_rect(w, h);
-    [c[0] - c[2] - 4.0, c[1], c[2], c[3]]
-}
-
-/// The point is inside the rectangle.
-pub fn hit_rect(r: Rect, at: (f32, f32)) -> bool {
-    contains(r, at)
-}
-
-fn contains(r: Rect, (x, y): (f32, f32)) -> bool {
-    x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
-}
-
-/// The button under a point.
-pub fn hit(layout: &[(Control, Rect)], at: (f32, f32)) -> Option<Control> {
-    // Movable controls paint after the hotbar HUD, with later buttons on top.
-    // Match that order even when a user deliberately overlaps two controls.
-    layout
-        .iter()
-        .rev()
-        .find(|(c, r)| !matches!(c, Control::Hotbar(_)) && contains(*r, at))
-        .or_else(|| layout.iter().find(|(_, r)| contains(*r, at)))
-        .map(|(c, _)| *c)
-}
-
-/// What the game does with the fingers' changes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Out {
-    Press(Control),
-    Release(Control),
-    /// Turn the view by this much, in GUI pixels dragged.
-    Look(f32, f32),
-    /// A short tap away from the buttons: use, or attack what the crosshair is on.
-    Tap,
-    /// A finger held still away from the buttons: mining starts, and stops when it lifts.
-    MineStart,
-    MineEnd,
-}
-
-/// How far a finger moves (GUI pixels) before a touch is a drag and not a tap.
-const SLOP: f32 = 8.0;
-/// How long a finger stays still (seconds) before it mines.
-const HOLD: f64 = 0.35;
-
-#[derive(Clone, Debug)]
-enum Kind {
-    Button(Control),
-    World { dragged: bool, mining: bool },
-}
-
-#[derive(Clone, Debug)]
-struct Finger {
-    id: u64,
-    kind: Kind,
-    start: (f32, f32),
-    last: (f32, f32),
-    since: f64,
-}
-
-/// The fingers on the screen while playing.
-#[derive(Clone, Debug, Default)]
-pub struct Touches {
-    fingers: Vec<Finger>,
-}
-
-impl Touches {
-    /// A finger went down at `at`, `now` seconds into some clock.
-    pub fn start(
+    /// winit's `WindowEvent::Touch`.
+    pub(super) fn touch_event(
         &mut self,
-        id: u64,
-        at: (f32, f32),
-        now: f64,
-        layout: &[(Control, Rect)],
-    ) -> Vec<Out> {
-        let mut out = self.end(id);
-        let kind = match hit(layout, at) {
-            Some(control) => {
-                out.push(Out::Press(control));
-                Kind::Button(control)
-            }
-            None => Kind::World {
-                dragged: false,
-                mining: false,
-            },
+        event_loop: &dyn EventLoopCtl,
+        touch: Touch,
+    ) -> Result<()> {
+        if self.menu_input_blocked() {
+            self.cancel_touch_for_reload();
+            return Ok(());
+        }
+        self.touch.seen = true;
+        self.touch.hardware.touch();
+        self.last_input = Instant::now();
+        let Some(batch) = self.touch_batch() else {
+            return Ok(());
         };
-        self.fingers.push(Finger {
-            id,
-            kind,
-            start: at,
-            last: at,
-            since: now,
-        });
-        out
-    }
-
-    /// A finger moved: the D-pad follows it from direction to direction, and a finger on the world turns
-    /// the view.
-    pub fn moved(&mut self, id: u64, at: (f32, f32), layout: &[(Control, Rect)]) -> Vec<Out> {
-        let Some(f) = self.fingers.iter_mut().find(|f| f.id == id) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        match &mut f.kind {
-            Kind::Button(control) if control.moves() => {
-                if let Some(next) = hit(layout, at).filter(|c| c.moves() && c != control) {
-                    out.push(Out::Release(*control));
-                    out.push(Out::Press(next));
-                    *control = next;
-                }
-            }
-            Kind::Button(_) => {}
-            Kind::World { dragged, .. } => {
-                let (dx, dy) = (at.0 - f.start.0, at.1 - f.start.1);
-                if !*dragged && dx.hypot(dy) > SLOP {
-                    *dragged = true;
-                }
-                if *dragged {
-                    out.push(Out::Look(at.0 - f.last.0, at.1 - f.last.1));
-                }
-            }
+        // A real finger owns input just as a hardware pointer does. Menu
+        // touches also pass through key_focus_mouse; world controls do not.
+        // Releases/cancellations only finish that finger's own actions.
+        if matches!(touch.phase, TouchPhase::Started | TouchPhase::Moved) {
+            self.pad_yield_input(event_loop);
         }
-        f.last = at;
-        out
-    }
-
-    /// A finger lifted.
-    pub fn end(&mut self, id: u64) -> Vec<Out> {
-        let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
-            return Vec::new();
-        };
-        match self.fingers.remove(i).kind {
-            Kind::Button(control) => vec![Out::Release(control)],
-            Kind::World { mining: true, .. } => vec![Out::MineEnd],
-            Kind::World { dragged: false, .. } => vec![Out::Tap],
-            Kind::World { .. } => Vec::new(),
-        }
-    }
-
-    /// UIKit cancelled a finger: release its holds without interpreting it as a tap.
-    pub fn cancel(&mut self, id: u64) -> Vec<Out> {
-        let mut out = self.end(id);
-        out.retain(|o| *o != Out::Tap);
-        out
-    }
-
-    /// Once a frame: a finger on the world that has stayed still long enough starts mining.
-    pub fn frame(&mut self, now: f64) -> Vec<Out> {
-        let mut out = Vec::new();
-        for f in &mut self.fingers {
-            if let Kind::World {
-                dragged: false,
-                mining,
-            } = &mut f.kind
-                && !*mining
-                && now - f.since >= HOLD
-            {
-                *mining = true;
-                out.push(Out::MineStart);
-            }
-        }
-        out
-    }
-
-    /// Every finger lifted at once (a screen opened over the game).
-    pub fn release_all(&mut self) -> Vec<Out> {
-        let ids: Vec<u64> = self.fingers.iter().map(|f| f.id).collect();
-        ids.into_iter().flat_map(|id| self.cancel(id)).collect()
-    }
-
-    /// A finger holds this button down (drawn pressed).
-    pub fn held(&self, control: Control) -> bool {
-        self.fingers
-            .iter()
-            .any(|f| matches!(f.kind, Kind::Button(c) if c == control))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn at(layout: &[(Control, Rect)], control: Control) -> (f32, f32) {
-        let r = layout.iter().find(|(c, _)| *c == control).unwrap().1;
-        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
-    }
-
-    #[test]
-    fn buttons_do_not_overlap_and_fit_the_screen() {
-        for (w, h) in [(633.0, 292.0), (427.0, 240.0), (480.0, 270.0)] {
-            let l = layout(w, h);
-            for (i, (a, ra)) in l.iter().enumerate() {
-                assert!(
-                    ra[0] >= 0.0 && ra[1] >= 0.0 && ra[0] + ra[2] <= w && ra[1] + ra[3] <= h,
-                    "{a:?} off screen"
-                );
-                for (b, rb) in &l[i + 1..] {
-                    let apart = ra[0] + ra[2] <= rb[0]
-                        || rb[0] + rb[2] <= ra[0]
-                        || ra[1] + ra[3] <= rb[1]
-                        || rb[1] + rb[3] <= ra[1];
-                    assert!(apart, "{a:?} overlaps {b:?} at {w}x{h}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_dpad_follows_a_sliding_finger() {
-        let l = layout(633.0, 292.0);
-        let mut t = Touches::default();
-        assert_eq!(
-            t.start(1, at(&l, Control::Forward), 0.0, &l),
-            [Out::Press(Control::Forward)]
+        let at = (
+            touch.location.x as f32 / batch.scale,
+            touch.location.y as f32 / batch.scale,
         );
-        assert!(t.held(Control::Forward));
-        assert_eq!(
-            t.moved(1, at(&l, Control::Right), &l),
-            [Out::Release(Control::Forward), Out::Press(Control::Right)]
-        );
-        // Off the pad, the last direction stays held, as in Pocket Edition.
-        assert_eq!(t.moved(1, (300.0, 100.0), &l), []);
-        assert_eq!(t.end(1), [Out::Release(Control::Right)]);
-        assert!(!t.held(Control::Right));
-    }
-
-    #[test]
-    fn a_quick_still_touch_taps_and_a_held_one_mines() {
-        let l = layout(633.0, 292.0);
-        let mut t = Touches::default();
-        assert_eq!(t.start(1, (300.0, 100.0), 0.0, &l), []);
-        assert_eq!(t.frame(0.1), []);
-        assert_eq!(t.end(1), [Out::Tap]);
-
-        t.start(2, (300.0, 100.0), 1.0, &l);
-        assert_eq!(t.frame(1.3), []);
-        assert_eq!(t.frame(1.4), [Out::MineStart]);
-        assert_eq!(t.frame(1.5), []);
-        assert_eq!(t.end(2), [Out::MineEnd]);
-    }
-
-    #[test]
-    fn a_dragging_finger_turns_the_view_and_does_not_tap() {
-        let l = layout(633.0, 292.0);
-        let mut t = Touches::default();
-        t.start(1, (300.0, 100.0), 0.0, &l);
-        // Within the slop (a thumb's wobble): no look yet, and still a tap candidate.
-        assert_eq!(t.moved(1, (305.0, 100.0), &l), []);
-        assert_eq!(t.moved(1, (313.0, 104.0), &l), [Out::Look(8.0, 4.0)]);
-        assert_eq!(t.frame(5.0), []);
-        assert_eq!(t.end(1), []);
-    }
-
-    #[test]
-    fn two_fingers_move_and_look_at_once() {
-        let l = layout(633.0, 292.0);
-        let mut t = Touches::default();
-        t.start(1, at(&l, Control::Forward), 0.0, &l);
-        t.start(2, (400.0, 100.0), 0.0, &l);
-        assert_eq!(t.moved(2, (420.0, 100.0), &l), [Out::Look(20.0, 0.0)]);
-        assert!(t.held(Control::Forward));
-        let mut all = t.release_all();
-        all.sort_by_key(|o| format!("{o:?}"));
-        assert_eq!(all, [Out::Release(Control::Forward)]);
-    }
-}
-
-#[cfg(test)]
-mod custom_layout_tests {
-    use super::*;
-    #[test]
-    fn unset_reset_and_invalid_positions_preserve_defaults() {
-        for (w, h) in [(844.0, 390.0), (1024.0, 768.0), (390.0, 844.0)] {
-            assert_eq!(
-                layout_with_positions(w, h, &[f32::NAN; 20]),
-                default_layout(w, h)
-            );
-            assert_eq!(
-                layout_with_positions(w, h, &[f32::INFINITY; 20]),
-                default_layout(w, h)
-            );
-        }
-    }
-    #[test]
-    fn moved_jump_uses_identical_paint_and_hit_rectangle_after_resize() {
-        let mut positions = [f32::NAN; 20];
-        positions[10] = 0.65;
-        positions[11] = 0.35;
-        for (w, h) in [(844.0, 390.0), (1194.0, 834.0), (390.0, 844.0)] {
-            let layout = layout_with_positions(w, h, &positions);
-            let r = layout.iter().find(|(c, _)| *c == Control::Jump).unwrap().1;
-            let centre = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
-            assert_eq!(hit(&layout, centre), Some(Control::Jump));
-            let mut fingers = Touches::default();
-            assert_eq!(
-                fingers.start(7, centre, 0.0, &layout),
-                vec![Out::Press(Control::Jump)]
-            );
-            assert_eq!(fingers.end(7), vec![Out::Release(Control::Jump)]);
-            assert!((centre.0 / w - 0.65).abs() < 0.0001);
-            assert!((centre.1 / h - 0.35).abs() < 0.0001);
-        }
-    }
-    #[test]
-    fn overlapping_controls_hit_the_button_painted_on_top_of_other_buttons_and_hotbar() {
-        let mut positions = [f32::NAN; 20];
-        let default = default_layout(650.0, 300.0);
-        let forward = default
-            .iter()
-            .find(|(c, _)| *c == Control::Forward)
-            .unwrap()
-            .1;
-        positions[10] = (forward[0] + forward[2] / 2.0) / 650.0;
-        positions[11] = (forward[1] + forward[3] / 2.0) / 300.0;
-        let buttons = layout_with_positions(650.0, 300.0, &positions);
-        assert_eq!(
-            hit(&buttons, (positions[10] * 650.0, positions[11] * 300.0)),
-            Some(Control::Jump)
-        );
-        positions[10] = 0.5;
-        positions[11] = 0.95;
-        let buttons = layout_with_positions(650.0, 300.0, &positions);
-        assert_eq!(hit(&buttons, (325.0, 285.0)), Some(Control::Jump));
-    }
-
-    #[test]
-    fn offscreen_centres_clamp_without_moving_hotbar_or_other_buttons() {
-        let mut positions = [f32::NAN; 20];
-        positions[10] = -20.0;
-        positions[11] = 30.0;
-        let layout = layout_with_positions(844.0, 390.0, &positions);
-        for ((c, r), (_, default)) in layout.iter().zip(default_layout(844.0, 390.0)) {
-            if *c == Control::Jump {
-                assert_eq!(r[0], 0.0);
-                assert_eq!(r[1] + r[3], 390.0);
+        let playing = self.touch_playing();
+        if playing {
+            // Loading or keyboard navigation can consume a menu finger's release.
+            // That old finger must not route a new world touch back into the menu.
+            self.touch_release_menu(event_loop);
+        } else {
+            if touch.phase == TouchPhase::Cancelled {
+                if self.touch.menu.as_ref().is_some_and(|f| f.id == touch.id) {
+                    self.touch_release_menu(event_loop);
+                }
             } else {
-                assert_eq!(*r, default);
+                self.touch_menu(event_loop, touch.id, touch.phase, at);
+            }
+            return Ok(());
+        }
+        let layout = touch::layout(batch.width, batch.height);
+        let out = match touch.phase {
+            TouchPhase::Started => {
+                let now = self.touch_now();
+                self.touch.fingers.start(touch.id, at, now, &layout)
+            }
+            TouchPhase::Moved => self.touch.fingers.moved(touch.id, at, &layout),
+            TouchPhase::Ended => self.touch.fingers.end(touch.id),
+            TouchPhase::Cancelled => self.touch.fingers.cancel(touch.id),
+        };
+        self.touch_act(out, batch.scale)
+    }
+
+    /// Drop all pending fingers and deferred clicks at the reload boundary.
+    /// No release is routed through a possibly replaced screen; the boundary
+    /// already released gameplay holds and the screen's drag state.
+    pub(super) fn cancel_touch_for_reload(&mut self) {
+        self.touch.menu = None;
+        self.touch.fingers.release_all();
+        self.touch.late.clear();
+        self.touch.holding = None;
+        self.touch.auto_break = None;
+        self.keys.release_source(Source::Touch);
+    }
+
+    /// Once a frame while playing: a block broken for the Hit button's tap is let go of when it is gone
+    /// (or was never there to break), so the attack does not run on into the next block.
+    fn touch_auto_break(&mut self) -> Result<()> {
+        let mining = self.mining.is_some();
+        let ticks = self.ticks;
+        let Some(state) = self.touch.auto_break.as_mut() else {
+            return Ok(());
+        };
+        if mining {
+            state.mining = true;
+        }
+        let done = if state.mining {
+            !mining
+        } else {
+            ticks > state.since + AUTO_BREAK_GRACE
+        };
+        if done {
+            self.touch.auto_break = None;
+            self.mouse_mapping(MouseButton::Left, false, Source::Touch)?;
+        }
+        Ok(())
+    }
+
+    /// A screen opened over the game: let go of the attack the Hit button was holding.
+    fn touch_stop_auto_break(&mut self) -> Result<()> {
+        if self.touch.auto_break.take().is_some() {
+            self.mouse_mapping(MouseButton::Left, false, Source::Touch)?;
+        }
+        Ok(())
+    }
+
+    /// Once a frame: a held finger starts mining, held-back clicks release, and a screen that opened over the
+    /// game lets go of every finger on it.
+    pub(super) fn touch_frame(&mut self, event_loop: &dyn EventLoopCtl) {
+        if self.menu_input_blocked() {
+            self.cancel_touch_for_reload();
+            return;
+        }
+        self.touch.hardware.refresh(
+            horizon_gamecontroller::keyboard_connected(),
+            horizon_gamecontroller::mouse_connected(),
+        );
+        if !self.touch_shown() {
+            return;
+        }
+        let playing = self.touch_playing();
+        if playing {
+            self.touch_release_menu(event_loop);
+        } else {
+            self.touch_menu_frame(event_loop);
+        }
+        let auto = if playing {
+            self.touch_auto_break()
+        } else {
+            self.touch_stop_auto_break()
+        };
+        if let Err(e) = auto {
+            log::warn!("Horizon: touch: {e}");
+        }
+        let out = if playing {
+            let now = self.touch_now();
+            self.touch.fingers.frame(now)
+        } else {
+            self.touch.fingers.release_all()
+        };
+        let ticks = self.ticks;
+        let (due, keep) = std::mem::take(&mut self.touch.late)
+            .into_iter()
+            .partition(|(_, at)| ticks > *at || !playing);
+        self.touch.late = keep;
+        let scale = self.touch_batch().map_or(1.0, |b| b.scale);
+        let result = due
+            .into_iter()
+            .try_for_each(|(button, _)| self.mouse_mapping(button, false, Source::Touch))
+            .and_then(|()| self.touch_act(out, scale));
+        if let Err(e) = result {
+            log::warn!("Horizon: touch: {e}");
+        }
+    }
+
+    /// Mouse look and clicks only count with the pointer grabbed, which a touch screen has no pointer for:
+    /// grab it as a click into the window would, or act as an agent's pointer where it cannot be grabbed.
+    fn touch_grab(&mut self) {
+        // Only when neither holds: a grab that fails (iOS has no pointer to grab) would otherwise be retried
+        // on every drag, and each try makes the mouse drop its next move (`grabMouse`'s ignoreFirstMove).
+        if self.captured || self.agent_pointer {
+            return;
+        }
+        self.capture(true);
+        if !self.captured {
+            self.agent_pointer = true;
+        }
+    }
+
+    /// The held item is used for as long as the button stays down: something eaten or drunk (its
+    /// `consumable` component), or a bow, crossbow, trident, shield, spyglass, goat horn or brush.
+    /// Live touch sources for the shared attack/use mapping. Short taps remain
+    /// held until their delayed release; a long press lives in `holding`.
+    pub(super) fn touch_holds_mouse_mapping(&self, button: MouseButton) -> bool {
+        self.touch.holding == Some(button)
+            || self.touch.late.iter().any(|(held, _)| *held == button)
+    }
+
+    fn touch_holds_use(&self) -> bool {
+        let Some(stack) = self.held() else {
+            return false;
+        };
+        matches!(
+            &*stack.item,
+            "minecraft:bow"
+                | "minecraft:crossbow"
+                | "minecraft:trident"
+                | "minecraft:shield"
+                | "minecraft:spyglass"
+                | "minecraft:goat_horn"
+                | "minecraft:brush"
+        ) || self
+            .res
+            .items()
+            .get(&stack.item)
+            .is_some_and(|info| info.consumable.is_some())
+    }
+
+    fn touch_act(&mut self, out: Vec<Out>, scale: f32) -> Result<()> {
+        if self.menu_input_blocked() {
+            self.cancel_touch_for_reload();
+            return Ok(());
+        }
+        for o in out {
+            match o {
+                Out::Press(Control::Hotbar(slot)) => self.selected = usize::from(slot),
+                Out::Press(Control::Sneak) => {
+                    // A toggle either way: the crouch option toggles a press, otherwise flip the held key
+                    // (as a controller's stick click does).
+                    if self.settings.toggle_crouch {
+                        self.mapped_key(
+                            KeyCode::ShiftLeft,
+                            true,
+                            false,
+                            KeyCode::ShiftLeft,
+                            Source::Touch,
+                        )?;
+                        self.mapped_key(
+                            KeyCode::ShiftLeft,
+                            false,
+                            false,
+                            KeyCode::ShiftLeft,
+                            Source::Touch,
+                        )?;
+                    } else {
+                        let sneaking = self.keys.held_by(&KeyCode::ShiftLeft, Source::Touch);
+                        self.mapped_key(
+                            KeyCode::ShiftLeft,
+                            !sneaking,
+                            false,
+                            KeyCode::ShiftLeft,
+                            Source::Touch,
+                        )?;
+                    }
+                }
+                // Hit/break: instant on a tap. An entity takes one swing; a block is broken without holding,
+                // by an attack that runs until it is gone; a second tap stops it. (With the toggle-attack
+                // option the press already latches the attack, so it stays one click.)
+                Out::Press(Control::Attack) => {
+                    self.touch_grab();
+                    if self.touch.auto_break.take().is_some() {
+                        self.mouse_mapping(MouseButton::Left, false, Source::Touch)?;
+                        continue;
+                    }
+                    let single = self.entity_targeted() || self.settings.toggle_attack;
+                    self.mouse_mapping(MouseButton::Left, true, Source::Touch)?;
+                    if single {
+                        self.touch.late.push((MouseButton::Left, self.ticks));
+                    } else {
+                        self.touch.auto_break = Some(AutoBreak {
+                            since: self.ticks,
+                            mining: false,
+                        });
+                    }
+                }
+                Out::Release(Control::Attack) => {}
+                // Use/place: the use button is down as long as the finger is, so eating, drawing a bow and
+                // placing blocks in a row work; a tap is held back a tick so it is not lost.
+                Out::Press(Control::Use) => {
+                    self.touch_grab();
+                    self.mouse_mapping(MouseButton::Right, true, Source::Touch)?;
+                }
+                Out::Release(Control::Use) => {
+                    self.touch.late.push((MouseButton::Right, self.ticks));
+                }
+                Out::Press(control) | Out::Release(control) => {
+                    if let Some(key) = key_of(control) {
+                        // Touch supplies a default action directly, with no physical-key rebinding.
+                        self.mapped_key(
+                            key,
+                            matches!(o, Out::Press(_)),
+                            false,
+                            key,
+                            Source::Touch,
+                        )?;
+                    }
+                }
+                Out::Look(dx, dy) => {
+                    self.touch_grab();
+                    let (dx, dy) = (f64::from(dx * scale), f64::from(dy * scale));
+                    // Relative motion, as an agent's `mouse-move` adds it: no pointer position to compare with.
+                    self.mouse.add_motion(dx, dy);
+                }
+                // Pocket Edition: a tap hits the entity it is on, and uses the item or block otherwise.
+                Out::Tap => {
+                    self.touch_grab();
+                    let button = if self.entity_targeted() {
+                        MouseButton::Left
+                    } else {
+                        MouseButton::Right
+                    };
+                    self.mouse_mapping(button, true, Source::Touch)?;
+                    self.touch.late.push((button, self.ticks));
+                }
+                // Holding still: what the hand holds decides, as in Pocket Edition. Food, potions and the items
+                // used for as long as they are held (a bow, a shield...) are used until the finger lifts;
+                // anything else mines.
+                Out::MineStart => {
+                    self.touch_grab();
+                    let button = if self.touch_holds_use() {
+                        MouseButton::Right
+                    } else {
+                        MouseButton::Left
+                    };
+                    self.touch.holding = Some(button);
+                    self.mouse_mapping(button, true, Source::Touch)?;
+                }
+                Out::MineEnd => {
+                    let button = self.touch.holding.take().unwrap_or(MouseButton::Left);
+                    self.mouse_mapping(button, false, Source::Touch)?;
+                }
             }
         }
+        Ok(())
+    }
+
+    // ---- menus: a finger is the mouse ----
+
+    /// The ✕ over a screen with no Done or Back of its own: an inventory, a container, creative, chat, the
+    /// statistics and advancements, a sign or a book. The title screens and the options have theirs.
+    fn touch_close_shown(&self) -> bool {
+        self.touch_shown()
+            && self.title.is_none()
+            && (self.sign_edit.is_some()
+                || self.book.is_some()
+                || !matches!(
+                    self.screen,
+                    Screen::Playing | Screen::Paused | Screen::Dead | Screen::Win | Screen::Options
+                ))
+    }
+
+    fn touch_menu(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u64,
+        phase: TouchPhase,
+        at: (f32, f32),
+    ) {
+        if !at.0.is_finite() || !at.1.is_finite() {
+            if self
+                .touch
+                .menu
+                .as_ref()
+                .is_some_and(|finger| finger.id == id)
+            {
+                self.touch_release_menu(event_loop);
+            }
+            return;
+        }
+        match phase {
+            TouchPhase::Started => {
+                if self.touch.menu.is_some() {
+                    return;
+                }
+                let on_close = self.touch_close_shown()
+                    && self
+                        .touch_batch()
+                        .is_some_and(|b| touch::hit_rect(touch::close_rect(b.width, b.height), at));
+                let on_keyboard = !on_close
+                    && self.touch_shown()
+                    && self.field_focused()
+                    && self.touch_batch().is_some_and(|b| {
+                        touch::hit_rect(touch::keyboard_rect(b.width, b.height), at)
+                    });
+                let target = if on_close {
+                    MenuTarget::Close
+                } else if on_keyboard {
+                    MenuTarget::Keyboard
+                } else {
+                    MenuTarget::Pointer
+                };
+                let mode = if target == MenuTarget::Pointer {
+                    self.touch_menu_mode(at)
+                } else {
+                    MenuMode::Tap
+                };
+                if target == MenuTarget::Pointer {
+                    match self.focused_field_rect() {
+                        Some(rect) if touch::hit_rect(rect, self.screen_point(at)) => {
+                            if self.system_keyboard_hidden() {
+                                self.show_system_keyboard();
+                            }
+                        }
+                        Some(_) if self.system_keyboard_up() => self.hide_system_keyboard(),
+                        _ => {}
+                    }
+                    self.touch_pointer(event_loop, at);
+                }
+                self.touch.menu = Some(MenuFinger {
+                    id,
+                    gesture: MenuGesture::new(at, mode),
+                    target,
+                    at,
+                    guard: (mode == MenuMode::Tap)
+                        .then(|| horizon_client::widgets::capture_pointer(self.screen_point(at))),
+                });
+            }
+            TouchPhase::Moved | TouchPhase::Ended => {
+                let Some(finger) = self.touch.menu.as_mut().filter(|finger| finger.id == id) else {
+                    return;
+                };
+                let target = finger.target;
+                finger.at = at;
+                let action = if phase == TouchPhase::Ended {
+                    finger.gesture.end(at)
+                } else {
+                    finger.gesture.moved(at)
+                };
+                if target == MenuTarget::Pointer {
+                    self.touch_pointer(event_loop, at);
+                }
+                self.touch_menu_action(event_loop, target, action);
+            }
+            TouchPhase::Cancelled => {
+                if self
+                    .touch
+                    .menu
+                    .as_ref()
+                    .is_some_and(|finger| finger.id == id)
+                {
+                    self.touch_release_menu(event_loop);
+                }
+            }
+        }
+    }
+
+    /// The same drawn targets the controller uses distinguish direct manipulation
+    /// from a tap. Fields retain selection dragging; sliders and slots retain holds.
+    fn touch_menu_mode(&self, at: (f32, f32)) -> MenuMode {
+        if self.screen == Screen::Inventory
+            || self.hud_editor_drag_target(self.screen_point(at))
+            || horizon_client::widgets::last_targets()
+                .iter()
+                .rev()
+                .any(|target| {
+                    matches!(
+                        target.kind,
+                        horizon_client::widgets::Kind::Slider { .. }
+                            | horizon_client::widgets::Kind::Field
+                            | horizon_client::widgets::Kind::Slot
+                    ) && touch::hit_rect(target.rect, self.screen_point(at))
+                })
+        {
+            MenuMode::Drag
+        } else {
+            MenuMode::Tap
+        }
+    }
+
+    fn touch_menu_action(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        target: MenuTarget,
+        action: MenuAction,
+    ) {
+        if action.finished {
+            self.touch.menu = None;
+        }
+        if action.scroll != 0.0 && target == MenuTarget::Pointer {
+            self.touch_wheel(event_loop, action.scroll);
+        }
+        if let Some(pressed) = action.button {
+            match (target, pressed) {
+                (MenuTarget::Pointer, _) => self.touch_button(event_loop, pressed),
+                (MenuTarget::Close, true) => {
+                    if let Err(error) = self.pad_back() {
+                        log::warn!("Horizon: touch close: {error}");
+                    }
+                }
+                (MenuTarget::Keyboard, true) => self.toggle_system_keyboard(),
+                _ => {}
+            }
+        }
+    }
+
+    /// Abandon a menu gesture when another input device or the world takes over.
+    /// A missing UIKit end event must neither latch all later fingers nor create a click.
+    fn touch_release_menu(&mut self, event_loop: &dyn EventLoopCtl) {
+        if let Some(mut finger) = self.touch.menu.take()
+            && finger.gesture.cancel().button == Some(false)
+            && finger.target == MenuTarget::Pointer
+        {
+            self.touch_button(event_loop, false);
+        }
+    }
+
+    /// Advance the delayed menu press/release after drawing the pointer.
+    fn touch_menu_frame(&mut self, event_loop: &dyn EventLoopCtl) {
+        let Some(finger) = self.touch.menu.as_mut() else {
+            return;
+        };
+        let target = finger.target;
+        let at = finger.at;
+        let action = finger.gesture.frame();
+        if action.button == Some(true)
+            && self
+                .touch
+                .menu
+                .as_ref()
+                .and_then(|finger| finger.guard.as_ref())
+                .is_some_and(|guard| {
+                    *guard != horizon_client::widgets::capture_pointer(self.screen_point(at))
+                })
+        {
+            // No press was dispatched yet: suppress it without inventing a release.
+            self.touch.menu = None;
+            return;
+        }
+        self.touch_menu_action(event_loop, target, action);
+    }
+
+    pub(super) fn touch_synthetic_input(&self) -> bool {
+        self.touch.synthetic
+    }
+
+    fn touch_window_event(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: WindowId,
+        event: WindowEvent,
+    ) {
+        let previous = std::mem::replace(&mut self.touch.synthetic, true);
+        self.handle_window_event(event_loop, id, event, super::input_trace::InputOrigin::Game);
+        self.touch.synthetic = previous;
+    }
+
+    fn touch_pointer(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
+        let (Some(id), Some(batch)) = (self.window.as_ref().map(|w| w.id()), self.screen_batch())
+        else {
+            return;
+        };
+        let at = self.screen_point(at);
+        let position =
+            PhysicalPosition::new(f64::from(at.0 * batch.scale), f64::from(at.1 * batch.scale));
+        self.touch_window_event(
+            event_loop,
+            id,
+            WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position,
+            },
+        );
+    }
+
+    fn touch_button(&mut self, event_loop: &dyn EventLoopCtl, pressed: bool) {
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else {
+            return;
+        };
+        let state = if pressed {
+            ElementState::Pressed
+        } else {
+            ElementState::Released
+        };
+        self.touch_window_event(
+            event_loop,
+            id,
+            WindowEvent::MouseInput {
+                device_id: DeviceId::dummy(),
+                state,
+                button: MouseButton::Left,
+            },
+        );
+    }
+
+    fn touch_wheel(&mut self, event_loop: &dyn EventLoopCtl, lines: f32) {
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else {
+            return;
+        };
+        self.touch_window_event(
+            event_loop,
+            id,
+            WindowEvent::MouseWheel {
+                device_id: DeviceId::dummy(),
+                delta: MouseScrollDelta::LineDelta(0.0, lines),
+                phase: TouchPhase::Moved,
+            },
+        );
+    }
+
+    // ---- drawing ----
+
+    /// The buttons over the HUD while playing: vanilla's button, a little see-through as Pocket Edition's
+    /// were, lit while held, with white marks shadowed like Minecraft's text.
+    pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
+        if !touch::controls_visible()
+            || !self.touch_shown()
+            || self.hardware_hides_touch()
+            || !self.touch_playing()
+            || self.touch_on_phone()
+        {
+            return;
+        }
+        let atlas = &self.gui.atlas;
+        for (control, r) in touch::layout(batch.width, batch.height) {
+            if matches!(control, Control::Hotbar(_)) {
+                continue;
+            }
+            let held = self.touch.fingers.held(control)
+                || (control == Control::Attack && self.touch.auto_break.is_some());
+            touch_button(batch, atlas, r, held);
+            shadowed(r, |r, color| glyph(batch, atlas, control, r, color));
+        }
+    }
+}
+
+impl Game<'_> {
+    /// The buttons over a screen: ✕ where the screen has no way out of its own on a touch screen
+    /// (`touch_close_shown`), and ⌨ beside it while a text field has focus.
+    pub(super) fn draw_touch_close(&mut self, batch: &mut HudBatch) {
+        if !touch::controls_visible() || self.hardware_hides_touch() || self.touch_on_phone() {
+            return;
+        }
+        let held = self
+            .touch
+            .menu
+            .as_ref()
+            .is_some_and(|finger| finger.target == MenuTarget::Close);
+        let keyboard = self.touch_shown() && self.field_focused();
+        let atlas = &self.gui.atlas;
+        if self.touch_close_shown() {
+            let r = touch::close_rect(batch.width, batch.height);
+            touch_button(batch, atlas, r, held);
+            shadowed(r, |r, color| {
+                // Two diagonals of cells.
+                let u = cell_size(r);
+                let (cx, cy) = ((r[0] + r[2] / 2.0).floor(), (r[1] + r[3] / 2.0).floor());
+                for i in -3..=3 {
+                    let d = i as f32 * u;
+                    batch.fill(atlas, cx + d - u / 2.0, cy + d - u / 2.0, u, u, color);
+                    batch.fill(atlas, cx - d - u / 2.0, cy + d - u / 2.0, u, u, color);
+                }
+            });
+        }
+        if keyboard {
+            let r = touch::keyboard_rect(batch.width, batch.height);
+            touch_button(
+                batch,
+                atlas,
+                r,
+                self.touch
+                    .menu
+                    .as_ref()
+                    .is_some_and(|finger| finger.target == MenuTarget::Keyboard),
+            );
+            shadowed(r, |r, color| {
+                // A keyboard: two rows of keys over a space bar.
+                let u = cell_size(r) * 0.75;
+                let (cx, cy) = ((r[0] + r[2] / 2.0).floor(), (r[1] + r[3] / 2.0).floor());
+                for row in 0..2 {
+                    for key in 0..5 {
+                        let x = cx + (key as f32 - 2.5) * u * 1.6;
+                        let y = cy + (row as f32 - 1.5) * u * 1.6;
+                        batch.fill(atlas, x, y, u, u, color);
+                    }
+                }
+                batch.fill(atlas, cx - 2.5 * u, cy + 1.7 * u, 5.0 * u, u, color);
+            });
+        }
+    }
+}
+
+impl Game<'_> {
+    /// What the phone shows when it is splitscreen's controller (`touch_on_phone`): the buttons that are
+    /// otherwise drawn over the game, in the phone window's pixels.
+    pub(super) fn phone_buttons(&mut self) -> Vec<horizon_airplay::Button> {
+        let Some(batch) = self.touch_batch().filter(|_| self.touch_shown()) else {
+            return Vec::new();
+        };
+        if !touch::controls_visible() {
+            return Vec::new();
+        }
+        let focused = self.field_focused();
+        let px = |r: touch::Rect| r.map(|v| v * batch.scale);
+        let mut buttons = Vec::new();
+        if self.touch_playing() {
+            for (control, r) in touch::layout(batch.width, batch.height) {
+                let label = match control {
+                    Control::Forward => "▲".to_owned(),
+                    Control::Back => "▼".to_owned(),
+                    Control::Left => "◀".to_owned(),
+                    Control::Right => "▶".to_owned(),
+                    Control::Sneak => "Sneak".to_owned(),
+                    Control::Jump => "Jump".to_owned(),
+                    Control::Perspective => "View".to_owned(),
+                    Control::Chat => "Chat".to_owned(),
+                    Control::Pause => "II".to_owned(),
+                    Control::Inventory => "•••".to_owned(),
+                    Control::Attack => "Hit".to_owned(),
+                    Control::Use => "Use".to_owned(),
+                    Control::Offhand => "Swap".to_owned(),
+                    Control::Hotbar(slot) => (slot + 1).to_string(),
+                };
+                buttons.push(horizon_airplay::Button {
+                    label,
+                    rect: px(r),
+                    held: self.touch.fingers.held(control)
+                        || (control == Control::Attack && self.touch.auto_break.is_some()),
+                });
+            }
+        } else {
+            if self.touch_close_shown() {
+                buttons.push(horizon_airplay::Button {
+                    label: "✕".to_owned(),
+                    rect: px(touch::close_rect(batch.width, batch.height)),
+                    held: self
+                        .touch
+                        .menu
+                        .as_ref()
+                        .is_some_and(|finger| finger.target == MenuTarget::Close),
+                });
+            }
+            if focused {
+                buttons.push(horizon_airplay::Button {
+                    label: "⌨".to_owned(),
+                    rect: px(touch::keyboard_rect(batch.width, batch.height)),
+                    held: self
+                        .touch
+                        .menu
+                        .as_ref()
+                        .is_some_and(|finger| finger.target == MenuTarget::Keyboard),
+                });
+            }
+        }
+        buttons
+    }
+}
+
+/// Vanilla's button sprite, nine-sliced to the touch button's size: highlighted while held, and see-through
+/// enough to keep the world behind it in sight.
+fn touch_button(
+    batch: &mut HudBatch,
+    atlas: &horizon_client::hud::HudAtlas,
+    r: touch::Rect,
+    held: bool,
+) {
+    let sprite = if held {
+        "gui/sprites/widget/button_highlighted"
+    } else {
+        "gui/sprites/widget/button"
+    };
+    let alpha = if held { 230 } else { 170 };
+    horizon_client::ui::nine_slice(
+        batch,
+        atlas,
+        sprite,
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        rgba(255, 255, 255, alpha),
+    );
+}
+
+/// The size of a mark's cell on a button `r`: two GUI pixels on the old 26-pixel buttons, growing with them.
+fn cell_size(r: touch::Rect) -> f32 {
+    (r[2] / 13.0).round().max(2.0)
+}
+
+/// Draw a mark twice, as Minecraft draws text: a dark copy a little down and right, then the white one.
+fn shadowed(r: touch::Rect, mut mark: impl FnMut(touch::Rect, u32)) {
+    let off = (cell_size(r) / 2.0).max(1.0);
+    mark([r[0] + off, r[1] + off, r[2], r[3]], rgba(63, 63, 63, 230));
+    mark(r, rgba(255, 255, 255, 240));
+}
+
+/// A button's mark, in cells of a few pixels centred on it.
+fn glyph(
+    batch: &mut HudBatch,
+    atlas: &horizon_client::hud::HudAtlas,
+    control: Control,
+    r: touch::Rect,
+    color: u32,
+) {
+    let (cx, cy) = ((r[0] + r[2] / 2.0).floor(), (r[1] + r[3] / 2.0).floor());
+    let u = cell_size(r);
+    let cell = |batch: &mut HudBatch, x: f32, y: f32, w: f32, h: f32| {
+        batch.fill(atlas, cx + x * u, cy + y * u, w * u, h * u, color);
+    };
+    // A triangle pointing up, down, left or right: rows (or columns) narrowing to its tip.
+    let arrow = |batch: &mut HudBatch, dir: (f32, f32)| {
+        for i in 0..4 {
+            let i = i as f32;
+            let len = 7.0 - 2.0 * i;
+            let at = 1.5 - i;
+            match dir {
+                (0.0, d) => cell(batch, -len / 2.0, at * -d - 0.5, len, 1.0),
+                (d, _) => cell(batch, at * -d - 0.5, -len / 2.0, 1.0, len),
+            }
+        }
+    };
+    match control {
+        Control::Forward => arrow(batch, (0.0, -1.0)),
+        Control::Back => arrow(batch, (0.0, 1.0)),
+        Control::Left => arrow(batch, (-1.0, 0.0)),
+        Control::Right => arrow(batch, (1.0, 0.0)),
+        // Sneak: a hollow diamond; jump: a filled one.
+        Control::Sneak | Control::Jump => {
+            for i in 0..4 {
+                let i = i as f32;
+                let len = 7.0 - 2.0 * i;
+                for y in [-i - 0.5, i - 0.5] {
+                    if control == Control::Jump {
+                        cell(batch, -len / 2.0, y, len, 1.0);
+                    } else {
+                        cell(batch, -len / 2.0, y, 1.0, 1.0);
+                        cell(batch, len / 2.0 - 1.0, y, 1.0, 1.0);
+                    }
+                }
+            }
+        }
+        // Perspective: an eye.
+        Control::Perspective => {
+            cell(batch, -2.5, -1.5, 5.0, 1.0);
+            cell(batch, -3.5, -0.5, 1.0, 1.0);
+            cell(batch, -0.5, -0.5, 1.0, 1.0);
+            cell(batch, 2.5, -0.5, 1.0, 1.0);
+            cell(batch, -2.5, 0.5, 5.0, 1.0);
+        }
+        // Chat: a speech bubble with its tail.
+        Control::Chat => {
+            cell(batch, -3.0, -2.5, 6.0, 4.0);
+            cell(batch, -2.0, 1.5, 1.0, 1.0);
+        }
+        // Pause: two bars.
+        Control::Pause => {
+            cell(batch, -2.0, -2.5, 1.5, 5.0);
+            cell(batch, 0.5, -2.5, 1.5, 5.0);
+        }
+        // The inventory: three dots, as Pocket Edition's button beside the hotbar.
+        Control::Inventory => {
+            for x in [-3.0, -0.5, 2.0] {
+                cell(batch, x, -0.5, 1.0, 1.0);
+            }
+        }
+        // Hit/break: a hammer, its head over a handle.
+        Control::Attack => {
+            cell(batch, -3.0, -3.0, 6.0, 2.0);
+            cell(batch, -1.0, -1.0, 2.0, 5.0);
+        }
+        // Use/place: a block, hollow, with a mark in its middle.
+        Control::Use => {
+            cell(batch, -3.0, -3.0, 6.0, 1.0);
+            cell(batch, -3.0, 2.0, 6.0, 1.0);
+            cell(batch, -3.0, -2.0, 1.0, 4.0);
+            cell(batch, 2.0, -2.0, 1.0, 4.0);
+            cell(batch, -1.0, -1.0, 2.0, 2.0);
+        }
+        // Offhand: two arrows, the upper one pointing right and the lower one left.
+        Control::Offhand => {
+            cell(batch, -3.0, -2.0, 6.0, 1.0);
+            cell(batch, 2.0, -3.0, 1.0, 1.0);
+            cell(batch, 2.0, -1.0, 1.0, 1.0);
+            cell(batch, -3.0, 1.0, 6.0, 1.0);
+            cell(batch, -3.0, 0.0, 1.0, 1.0);
+            cell(batch, -3.0, 2.0, 1.0, 1.0);
+        }
+        Control::Hotbar(_) => {}
     }
 }

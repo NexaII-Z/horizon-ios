@@ -340,6 +340,36 @@ pub fn touch_preferences() -> ([f32; 20], bool) {
     (positions, hidden)
 }
 
+/// Snapshot ABI v2 shared with TouchControls.swift (`horizon_touch_preferences_v2`): thirteen normalized
+/// button centres (NaN for the built-in placement), thirteen size multipliers (NaN for the built-in size)
+/// and bit zero to hide paint only (never input). Against a launcher that only has v1, the original ten
+/// buttons keep their placement and the new ones and every size stay built-in.
+pub fn touch_preferences_v2() -> ([f32; 26], [f32; 13], bool) {
+    let positions = [f32::NAN; 26];
+    let sizes = [f32::NAN; 13];
+    #[cfg(target_os = "ios")]
+    let (positions, sizes, hidden) = {
+        let mut values = [f32::NAN; 39];
+        let hidden = match ios::touch_preferences_v2(&mut values) {
+            Some(hidden) => hidden,
+            None => {
+                let mut original = [f32::NAN; 20];
+                let hidden = ios::touch_preferences(&mut original);
+                values[..20].copy_from_slice(&original);
+                hidden
+            }
+        };
+        let mut positions = positions;
+        positions.copy_from_slice(&values[..26]);
+        let mut sizes = sizes;
+        sizes.copy_from_slice(&values[26..]);
+        (positions, sizes, hidden)
+    };
+    #[cfg(not(target_os = "ios"))]
+    let hidden = false;
+    (positions, sizes, hidden)
+}
+
 #[cfg(target_os = "ios")]
 mod ios {
     use std::ffi::{CStr, CString, c_char, c_void};
@@ -406,6 +436,30 @@ mod ios {
             }
         });
         snapshot.is_some_and(|call| call(positions.as_mut_ptr(), 20) & 1 != 0)
+    }
+
+    /// ABI v2: 26 centres, then 13 sizes. `None` when the launcher framework has no v2 export.
+    pub fn touch_preferences_v2(values: &mut [f32; 39]) -> Option<bool> {
+        type Snapshot = extern "C" fn(*mut f32, u32) -> u32;
+        static SNAPSHOT: std::sync::OnceLock<Option<Snapshot>> = std::sync::OnceLock::new();
+        let snapshot = SNAPSHOT.get_or_init(|| {
+            let path = framework()?;
+            // SAFETY: this bundled Swift C export accepts exactly 39 writable
+            // floats and a capacity, keeps no pointer and uses a locked snapshot.
+            unsafe {
+                let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
+                if handle.is_null() {
+                    return None;
+                }
+                let symbol = libc::dlsym(handle, c"horizon_touch_preferences_v2".as_ptr());
+                if symbol.is_null() {
+                    return None;
+                }
+                Some(std::mem::transmute::<*mut c_void, Snapshot>(symbol))
+            }
+        });
+        let call = (*snapshot)?;
+        Some(call(values.as_mut_ptr(), 39) & 1 != 0)
     }
 
     pub fn present() -> bool {

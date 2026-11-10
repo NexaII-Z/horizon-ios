@@ -72,6 +72,45 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertEqual(manual.gui, CGSize(width: 1266, height: 585))
         XCTAssertEqual(manual.pointsPerUnit, 2.0 / 3.0, accuracy: 0.0001)
     }
+    func testLayoutsSavedBeforeSizesExistedKeepTheirPositions() throws {
+        let old = Data(#"{"centres":{"5":{"x":0.5,"y":0.4}},"showControls":true}"#.utf8)
+        let config = try JSONDecoder().decode(TouchConfiguration.self, from: old)
+        XCTAssertEqual(config.centres["5"], TouchCentre(x: 0.5, y: 0.4))
+        XCTAssertTrue(config.sizes.isEmpty)
+    }
+    func testHitUseAndOffhandAreEditableAndSizesRoundTrip() {
+        XCTAssertEqual(TouchButton.allCases.count, 13)
+        XCTAssertEqual([TouchButton.attack, .use, .offhand].map(\.rawValue), [10, 11, 12])
+        let model = TouchPreferences(defaults: defaults)
+        var draft = model.configuration
+        let size = CGSize(width: 650, height: 300)
+        let before = draft.rect(.attack, in: size)
+        draft.setScale(.attack, 1.5)
+        let after = draft.rect(.attack, in: size)
+        XCTAssertEqual(after.width, before.width * 1.5, accuracy: 0.001)
+        XCTAssertEqual(after.midX, before.midX, accuracy: 0.001)
+        draft.setScale(.attack, 99)
+        XCTAssertEqual(draft.scale(.attack), 2)
+        draft.setScale(.attack, 1)
+        XCTAssertNil(draft.sizes["10"], "A size of 100% is the built-in size")
+        draft.setScale(.use, 0.75); model.save(draft)
+        let loaded = TouchPreferences(defaults: defaults).configuration
+        XCTAssertEqual(loaded.scale(.use), 0.75)
+        let (values, _) = model.snapshotV2()
+        XCTAssertEqual(values.count, 39)
+        XCTAssertEqual(values[26 + 11], 0.75)
+        XCTAssertTrue(values[26 + 5].isNaN)
+    }
+    func testV2ExportWritesOnlyItsDocumentedCapacity() {
+        var values = [Float](repeating: 123, count: 41)
+        values.withUnsafeMutableBufferPointer { buffer in
+            XCTAssertEqual(horizonTouchPreferencesV2(buffer.baseAddress, 38), 0)
+            XCTAssertTrue(buffer.allSatisfy { $0 == 123 })
+            _ = horizonTouchPreferencesV2(buffer.baseAddress, 39)
+        }
+        XCTAssertEqual(values[39], 123); XCTAssertEqual(values[40], 123)
+        XCTAssertEqual(horizonTouchPreferencesV2(nil, 39), 0)
+    }
     func testCExportWritesOnlyItsDocumentedCapacity() {
         var values = [Float](repeating: 123, count: 22)
         values.withUnsafeMutableBufferPointer { buffer in
